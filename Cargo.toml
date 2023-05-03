@@ -1,0 +1,21 @@
+[package]
+name = "src-dst-clarifier"
+version = "0.1.0"
+edition = "2021"
+authors = ["K--A"]
+
+description = "Given SRC and DST path, handle situations well and produce `Iterator<(reader, writer)>`."
+
+documentation = "https://docs.rs/src-dst-clarifier"
+repository = "https://github.com/eternal-io/src-dst-clarifier"
+license = "MIT OR Apache-2.0"
+
+keywords = ["path", "parse", "clarify", "clarifier"]
+categories = ["filesystem", "parsing", "command-line-interface"]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+thiserror = "1.0.40"
+
+kalavor = { path = "../kalavor", version = "~0.1" }
