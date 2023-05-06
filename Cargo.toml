@@ -1,10 +1,10 @@
 [package]
 name = "src-dst-clarifier"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["K--A"]
 
-description = "Given SRC and DST path, handle situations well and produce `Iterator<(reader, writer)>`."
+description = "Give SRC and DST path, each may be a FILE or a DIR (even STDIO). Handle situations well and produce iterator over FILE-FILE pairs."
 
 documentation = "https://docs.rs/src-dst-clarifier"
 repository = "https://github.com/eternal-io/src-dst-clarifier"

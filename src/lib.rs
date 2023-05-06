@@ -8,17 +8,13 @@ use thiserror::Error;
 
 use kalavor::Katetime;
 
-pub mod ioers;
-
-use ioers::*;
-
 /// Use single hyphen (`-`) as path to indicate IO from Stdio.
 ///
 /// # Notes
 ///
 /// - Auto time-based unique naming (`auto_tnamed_dst_`) only takes effect when DST is not provided.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ParseConfig {
+pub struct SrcDstConfig {
     pub allow_from_stdin: bool,
     pub allow_to_stdout: bool,
 
@@ -31,7 +27,7 @@ pub struct ParseConfig {
     pub allow_inplace: bool,
 }
 
-impl ParseConfig {
+impl SrcDstConfig {
     pub fn new<S: AsRef<OsStr>>(default_extension: S) -> Self {
         Self {
             allow_from_stdin: true,
@@ -75,7 +71,7 @@ impl ParseConfig {
         &self,
         src: P,
         dst: Option<P>,
-    ) -> io::Result<Result<IoPairs, ParseError>> {
+    ) -> io::Result<Result<SrcDstPairs, SrcDstError>> {
         enum InnerSource {
             Stdin,
             File(PathBuf),
@@ -128,32 +124,33 @@ impl ParseConfig {
         };
 
         if matches!(src, InnerSource::Stdin) && !self.allow_from_stdin {
-            return Ok(Err(ParseError::DisallowFromStdin)); // 1
+            return Ok(Err(SrcDstError::DisallowFromStdin)); // 1
         }
         if matches!(dst, InnerDrain::Stdout) && !self.allow_to_stdout {
-            return Ok(Err(ParseError::DisallowToStdout)); // 2
+            return Ok(Err(SrcDstError::DisallowToStdout)); // 2
         }
         if matches!(dst, InnerDrain::NotProvided) {
             if matches!(src, InnerSource::Dir(_)) && !self.auto_tnamed_dst_dir {
-                return Ok(Err(ParseError::ForbidAutoTnamedDstDir)); // 4
+                return Ok(Err(SrcDstError::ForbidAutoTnamedDstDir)); // 4
             } else if !self.auto_tnamed_dst_file {
-                return Ok(Err(ParseError::ForbidAutoTnamedDstFile)); // 3
+                return Ok(Err(SrcDstError::ForbidAutoTnamedDstFile)); // 3
             }
         }
         if let InnerDrain::Dir(parent) = &dst {
             if let InnerSource::File(src) = &src {
                 if fs::canonicalize(parent)? == fs::canonicalize(src)?.parent().unwrap() {
-                    dst = InnerDrain::NotProvided; // 当 DST目录 与 SRC文件所在目录 相同时，切换至 tname
+                    dst = InnerDrain::NotProvided; // 当 DST-Dir 与 SRC-File所在目录 相同时，切换至 tname
                 }
             } else if !self.allow_inplace {
                 if let InnerSource::Dir(src) = &src {
                     if fs::canonicalize(parent)? == fs::canonicalize(src)? {
-                        return Ok(Err(ParseError::Inplaced));
+                        return Ok(Err(SrcDstError::Inplaced));
                     }
                 }
             }
         }
 
+        let mut tnamed = false;
         let (src, dst): (Source, Drain) = match src {
             InnerSource::Stdin | InnerSource::File(_) => {
                 fn dst_parent_src_name(src: &InnerSource, dst: &InnerDrain) -> io::Result<PathBuf> {
@@ -224,10 +221,10 @@ impl ParseConfig {
                 }
 
                 match dst {
-                    InnerDrain::Stdout => return Ok(Err(ParseError::ManyToOne)),
-                    InnerDrain::File(_) => return Ok(Err(ParseError::ManyToOne)),
+                    InnerDrain::Stdout => return Ok(Err(SrcDstError::ManyToOne)),
+                    InnerDrain::File(_) => return Ok(Err(SrcDstError::ManyToOne)),
                     InnerDrain::Dir(dst) => (Source::Files(shallow_walk(src)?), Drain::Single(dst)),
-                    InnerDrain::NotExist(_) => return Ok(Err(ParseError::DstDirNotExist)),
+                    InnerDrain::NotExist(_) => return Ok(Err(SrcDstError::DstDirNotExist)),
                     InnerDrain::NotProvided => {
                         // ./inputs => ./inputs-A01123-0456-0789
                         let mut dst = src
@@ -245,15 +242,17 @@ impl ParseConfig {
                             Katetime::now_datetime()
                         ));
 
+                        tnamed = true;
                         (Source::Files(shallow_walk(src)?), Drain::Single(dst))
                     }
                 }
             }
         };
 
-        Ok(Ok(IoPairs {
+        Ok(Ok(SrcDstPairs {
             src,
             dst,
+            tnamed_dir: tnamed,
             finished: false,
         }))
     }
@@ -261,7 +260,7 @@ impl ParseConfig {
 
 #[non_exhaustive]
 #[derive(Error, Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ParseError {
+pub enum SrcDstError {
     #[error("disallow read from stdin")]
     DisallowFromStdin = 1,
     #[error("disallow write to stdout")]
@@ -274,58 +273,66 @@ pub enum ParseError {
     #[error("there may be a potential to `open` and `create` the same file at the same time")]
     Inplaced,
 
-    #[error("many-to-one map is not allowed")]
+    #[error("unable to write multiple files to one file")]
     ManyToOne,
     #[error("specified DST directory does not exist")]
     DstDirNotExist,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Src {
+    File(PathBuf),
+    Stdin,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Dst {
+    File(PathBuf),
+    Stdout,
+}
+
 #[derive(Debug)]
-pub struct IoPairs {
+pub struct SrcDstPairs {
     src: Source,
     dst: Drain,
 
+    tnamed_dir: bool,
     finished: bool,
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum Source {
-    Stdin,
-    File(PathBuf),
-    /// 注意文件列表应该是倒过来排序的！这样就能把它们一个个 pop 出来了。
-    Files(Vec<PathBuf>),
+impl SrcDstPairs {
+    /// **Before consuming the path pair, call this method to create time-based named directory!**
+    pub fn create_tnamed_dir(&self) -> io::Result<()> {
+        if let Drain::Single(dir) = &self.dst {
+            if self.tnamed_dir {
+                fs::create_dir(dir)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn is_batch(&self) -> bool {
+        matches!(self.src, Source::Files(_))
+    }
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum Drain {
-    Stdout,
-    /// 注意这玩意必须手动拼接！（如果 SRC 是 [`Source::Files`] 的话）也就是文件名相同，但父目录不同。
-    Single(PathBuf),
-}
-
-impl Iterator for IoPairs {
-    type Item = Box<dyn InputOutput>;
+impl Iterator for SrcDstPairs {
+    type Item = (Src, Dst);
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.finished {
             return None;
         }
 
-        match &mut self.dst {
-            Drain::Stdout => match &mut self.src {
+        match &self.dst {
+            Drain::Stdout => match &self.src {
                 Source::Stdin => {
                     self.finished = true;
-                    Some(Box::new(ClarifiedIo::new(
-                        ReadStdin::new(),
-                        WriteStdout::new(),
-                    )))
+                    Some((Src::Stdin, Dst::Stdout))
                 }
                 Source::File(src) => {
                     self.finished = true;
-                    Some(Box::new(ClarifiedIo::new(
-                        ReadFile::new(src),
-                        WriteStdout::new(),
-                    )))
+                    Some((Src::File(src.to_owned()), Dst::Stdout))
                 }
                 Source::Files(_) => unreachable!(),
             },
@@ -333,31 +340,37 @@ impl Iterator for IoPairs {
             Drain::Single(dst) => match &mut self.src {
                 Source::Stdin => {
                     self.finished = true;
-                    Some(Box::new(ClarifiedIo::new(
-                        ReadStdin::new(),
-                        WriteFile::new(dst),
-                    )))
+                    Some((Src::Stdin, Dst::File(dst.to_owned())))
                 }
                 Source::File(src) => {
                     self.finished = true;
-                    Some(Box::new(ClarifiedIo::new(
-                        ReadFile::new(src),
-                        WriteFile::new(dst),
-                    )))
+                    Some((Src::File(src.to_owned()), Dst::File(dst.to_owned())))
                 }
                 Source::Files(srcs) => match srcs.pop() {
                     None => None,
                     Some(src) => {
                         let dst = dst.join(src.file_name().unwrap());
-                        Some(Box::new(ClarifiedIo::new(
-                            ReadFile::new(src),
-                            WriteFile::new(dst),
-                        )))
+                        Some((Src::File(src), Dst::File(dst)))
                     }
                 },
             },
         }
     }
+}
+
+#[derive(Debug)]
+enum Source {
+    Stdin,
+    File(PathBuf),
+    /// 注意文件列表应该是倒过来排序的！这样就能把它们一个个 pop 出来了。
+    Files(Vec<PathBuf>),
+}
+
+#[derive(Debug)]
+enum Drain {
+    Stdout,
+    /// 注意这玩意必须手动拼接！（如果 SRC 是 [`Source::Files`] 的话）也就是文件名相同，但父目录不同。
+    Single(PathBuf),
 }
 
 /// 我该怎么做测试？只是简单跑一下`cargo test -- --nocapture`吗？
@@ -367,7 +380,7 @@ mod tests {
 
     #[test]
     fn test() {
-        match ParseConfig::new("png").parse(".", None) {
+        match SrcDstConfig::new("png").parse(".", None) {
             Err(e) => println!("{e}"),
             Ok(p) => match p {
                 Err(e) => println!("{e}"),
